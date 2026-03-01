@@ -10,6 +10,9 @@ import {
   getProjectSummary,
   updateChunkMetadata,
 } from "./db.ts";
+import { writeConfig, readConfig } from "./config.ts";
+import { getAvailableLanguages } from "./languages/registry.ts";
+import { getSupportedExtensions } from "./parser.ts";
 
 const args = Bun.argv.slice(2);
 const command = args[0];
@@ -18,14 +21,16 @@ function usage() {
   console.log(`chunkr — Tree-sitter code chunking tool
 
 Commands:
-  init              Create .chunkr.db with schema
-  index [path]      Index files (full scan or incremental via git diff)
-  status            Show files changed since last index
-  query <file>      Show all chunk metadata (YAML) for a file
-  chunk <file> <n>  Show chunk body + metadata (n = start line or chunk index)
-  summary           Project overview: file count, languages, chunks
-  describe <file> <chunk_index>
-                    Update a chunk's description (reads from stdin)`);
+  init [--lang <name>]  Create .chunkr.db and .chunkr.json (default: typescript)
+  index [path]          Index files (full scan or incremental via git diff)
+  status                Show files changed since last index
+  query <file>          Show all chunk metadata (YAML) for a file
+  chunk <file> <n>      Show chunk body + metadata (n = start line or chunk index)
+  summary               Project overview: file count, languages, chunks
+  describe <file> <idx> Update a chunk's description (reads from stdin)
+  agent                 Output markdown guide for LLM consumption
+
+Languages: ${getAvailableLanguages().join(", ")}`);
 }
 
 async function main() {
@@ -39,9 +44,21 @@ async function main() {
 
   switch (command) {
     case "init": {
+      let lang = "typescript";
+      const langIdx = args.indexOf("--lang");
+      if (langIdx !== -1 && args[langIdx + 1]) {
+        lang = args[langIdx + 1];
+      }
+      const available = getAvailableLanguages();
+      if (!available.includes(lang)) {
+        console.error(`Unknown language: "${lang}". Available: ${available.join(", ")}`);
+        process.exit(1);
+      }
       const db = initDb(dbPath);
       db.close();
+      writeConfig(root, { lang });
       console.log(`Created ${dbPath}`);
+      console.log(`Language: ${lang} (saved to .chunkr.json)`);
       break;
     }
 
@@ -171,6 +188,42 @@ async function main() {
       updateChunkMetadata(db, chunk.id!, metadata);
       console.log(`Updated description for ${relPath} chunk ${chunkIndex}`);
       db.close();
+      break;
+    }
+
+    case "agent": {
+      const config = readConfig(root);
+      const lang = config?.lang ?? "typescript";
+      const extensions = getSupportedExtensions(lang).join(", ");
+
+      let summary = { fileCount: 0, chunkCount: 0 };
+      try {
+        const db = openDb(dbPath);
+        const s = getProjectSummary(db);
+        summary = { fileCount: s.fileCount, chunkCount: s.chunkCount };
+        db.close();
+      } catch {
+        // DB might not exist yet
+      }
+
+      console.log(`# chunkr — Code Index
+
+This project is indexed with chunkr. Language: **${lang}** (${extensions} files).
+
+## Commands
+- \`chunkr query <file>\` — Show YAML metadata for all chunks in a file (no bodies)
+- \`chunkr chunk <file> <line>\` — Get a specific chunk's source code + metadata
+- \`chunkr summary\` — Project overview (file count, chunk count)
+- \`chunkr status\` — Files changed since last index
+- \`chunkr index\` — Re-index changed files
+
+## Workflow
+1. Use \`chunkr summary\` to understand project scope
+2. Use \`chunkr query <file>\` to see what's in a file without reading it
+3. Use \`chunkr chunk <file> <line>\` to retrieve only the code you need
+4. After modifying files, run \`chunkr index\` to update the index
+
+Indexed: ${summary.fileCount} files, ${summary.chunkCount} chunks.`);
       break;
     }
 
