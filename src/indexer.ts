@@ -11,9 +11,8 @@ import {
   deleteFile,
 } from "./db.ts";
 import { parseFile, isSupported, getSupportedExtensions } from "./parser.ts";
+import { getProjectLang } from "./config.ts";
 import type { ChunkRecord } from "./types.ts";
-
-const SUPPORTED_GLOBS = getSupportedExtensions().map((ext) => `**/*${ext}`);
 
 export interface IndexResult {
   filesIndexed: number;
@@ -101,21 +100,28 @@ async function getUncommittedFiles(rootDir: string): Promise<string[]> {
 }
 
 /** Scan for all supported files in the project */
-async function scanAllFiles(rootDir: string): Promise<string[]> {
-  const glob = new Bun.Glob("**/*.{ts,tsx,js,jsx}");
+async function scanAllFiles(rootDir: string, langName: string): Promise<string[]> {
+  const extensions = getSupportedExtensions(langName);
+  const globPattern = `**/*.{${extensions.map((e) => e.slice(1)).join(",")}}`;
+  const glob = new Bun.Glob(globPattern);
   const files: string[] = [];
   for await (const path of glob.scan({
     cwd: rootDir,
     absolute: false,
     onlyFiles: true,
   })) {
-    // Skip node_modules, .git, dist, etc.
     if (
       path.startsWith("node_modules/") ||
       path.startsWith(".git/") ||
+      path.startsWith(".claude/") ||
       path.startsWith("dist/") ||
       path.startsWith("out/") ||
-      path.startsWith(".worktrees/")
+      path.startsWith("obj/") ||
+      path.startsWith("bin/") ||
+      path.startsWith(".worktrees/") ||
+      path.includes("/node_modules/") ||
+      path.includes("/obj/") ||
+      path.includes("/bin/")
     ) {
       continue;
     }
@@ -153,6 +159,7 @@ export async function indexProject(
   };
 
   // Determine which files need indexing
+  const langName = getProjectLang(resolvedRoot);
   const lastCommit = getProjectValue(db, "last_commit");
   const headCommit = await getHeadCommit(resolvedRoot);
 
@@ -162,10 +169,10 @@ export async function indexProject(
     const committed = await getChangedFiles(resolvedRoot, lastCommit);
     const uncommitted = await getUncommittedFiles(resolvedRoot);
     const allChanged = new Set([...committed, ...uncommitted]);
-    filesToIndex = [...allChanged].filter((f) => isSupported(f));
+    filesToIndex = [...allChanged].filter((f) => isSupported(langName, f));
   } else {
     // Full scan
-    filesToIndex = await scanAllFiles(resolvedRoot);
+    filesToIndex = await scanAllFiles(resolvedRoot, langName);
   }
 
   // Index each file
@@ -192,7 +199,7 @@ export async function indexProject(
     }
 
     // Parse the file
-    const newChunks = await parseFile(filePath, source);
+    const newChunks = await parseFile(langName, filePath, source);
 
     // Get existing chunk hashes to preserve unchanged metadata
     const existingHashes = getExistingChunkHashes(db, filePath);
@@ -243,6 +250,7 @@ export async function getStatus(rootDir: string, dbPath?: string) {
     return { lastCommit: null, changedFiles: [], isInitialized: false };
   }
 
+  const langName = getProjectLang(resolvedRoot);
   const lastCommit = getProjectValue(db, "last_commit");
   const headCommit = await getHeadCommit(resolvedRoot);
 
@@ -251,7 +259,7 @@ export async function getStatus(rootDir: string, dbPath?: string) {
     const committed = await getChangedFiles(resolvedRoot, lastCommit);
     const uncommitted = await getUncommittedFiles(resolvedRoot);
     changedFiles = [...new Set([...committed, ...uncommitted])].filter((f) =>
-      isSupported(f)
+      isSupported(langName, f)
     );
   }
 
