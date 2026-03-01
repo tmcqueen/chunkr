@@ -6,10 +6,6 @@ function extractMetadata(
   node: any,
   lines: string[]
 ): ChunkMetadata | null {
-  const startLine = node.startPosition.row + 1;
-  const endLine = node.endPosition.row + 1;
-  const lineRange: [number, number] = [startLine, endLine];
-
   // Unwrap export_statement
   if (node.type === "export_statement") {
     let inner: any = null;
@@ -21,12 +17,11 @@ function extractMetadata(
       }
     }
     if (!inner) {
-      return { name: "export", type: "export", line_range: lineRange };
+      return { name: "export", type: "export" };
     }
     const meta = extractMetadata(inner, lines);
     if (meta) {
       meta.exports = true;
-      meta.line_range = lineRange;
     }
     return meta;
   }
@@ -34,32 +29,28 @@ function extractMetadata(
   switch (node.type) {
     case "class_declaration":
     case "abstract_class_declaration":
-      return extractClass(node, lineRange);
+      return extractClass(node);
     case "function_declaration":
-      return extractFunction(node, lineRange);
+      return extractFunction(node);
     case "lexical_declaration":
-      return extractLexical(node, lineRange);
+      return extractLexical(node);
     case "enum_declaration":
-      return extractEnum(node, lineRange);
+      return extractEnum(node);
     case "interface_declaration":
-      return extractInterface(node, lineRange);
+      return extractInterface(node);
     case "type_alias_declaration":
-      return extractTypeAlias(node, lineRange);
+      return extractTypeAlias(node);
     case "expression_statement":
       return {
         name: node.text.substring(0, 40).replace(/\n/g, " "),
         type: "expression",
-        line_range: lineRange,
       };
     default:
-      return { name: node.type, type: node.type, line_range: lineRange };
+      return { name: node.type, type: node.type };
   }
 }
 
-function extractClass(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractClass(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
   const children: ChildInfo[] = [];
 
@@ -73,48 +64,34 @@ function extractClass(
         const methodName = member.childForFieldName("name")?.text ?? "anonymous";
         const params = extractParams(member.childForFieldName("parameters"));
         const ret = member.childForFieldName("return_type")?.text?.replace(/^:\s*/, "");
-        const child: ChildInfo = {
-          name: methodName,
-          type: "method",
-          line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-        };
+        const child: ChildInfo = { name: methodName, type: "method" };
         if (params.length > 0) child.params = params;
         if (ret) child.returns = ret;
         children.push(child);
       } else if (member.type === "public_field_definition") {
         const fieldName = member.childForFieldName("name")?.text ?? "anonymous";
-        children.push({
-          name: fieldName,
-          type: "property",
-          line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-        });
+        children.push({ name: fieldName, type: "property" });
       }
     }
   }
 
-  const meta: ChunkMetadata = { name, type: "class", line_range: lineRange };
+  const meta: ChunkMetadata = { name, type: "class" };
   if (children.length > 0) meta.children = children;
   return meta;
 }
 
-function extractFunction(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractFunction(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
   const params = extractParams(node.childForFieldName("parameters"));
   const ret = node.childForFieldName("return_type")?.text?.replace(/^:\s*/, "");
 
-  const meta: ChunkMetadata = { name, type: "function", line_range: lineRange };
+  const meta: ChunkMetadata = { name, type: "function" };
   if (params.length > 0) meta.params = params;
   if (ret) meta.returns = ret;
   return meta;
 }
 
-function extractLexical(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractLexical(node: any): ChunkMetadata {
   let kind = "const";
   for (let i = 0; i < node.childCount; i++) {
     const child = node.child(i);
@@ -129,37 +106,28 @@ function extractLexical(
   if (value?.type === "arrow_function") {
     const params = extractParams(value.childForFieldName("parameters"));
     const ret = value.childForFieldName("return_type")?.text?.replace(/^:\s*/, "");
-    const meta: ChunkMetadata = { name, type: kind, line_range: lineRange };
+    const meta: ChunkMetadata = { name, type: kind };
     if (params.length > 0) meta.params = params;
     if (ret) meta.returns = ret;
     return meta;
   }
 
-  return { name, type: kind, line_range: lineRange };
+  return { name, type: kind };
 }
 
-function extractEnum(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractEnum(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "enum", line_range: lineRange };
+  return { name, type: "enum" };
 }
 
-function extractInterface(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractInterface(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "interface", line_range: lineRange };
+  return { name, type: "interface" };
 }
 
-function extractTypeAlias(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractTypeAlias(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "type", line_range: lineRange };
+  return { name, type: "type" };
 }
 
 function extractParams(paramsNode: any): string[] {

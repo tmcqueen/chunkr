@@ -1,6 +1,7 @@
 export interface FileRecord {
   path: string;
   hash: string;
+  extension: string | null;
   gitCommit: string | null;
   lastIndexed: number;
 }
@@ -21,7 +22,6 @@ export interface ChildInfo {
   type: string;
   params?: string[];
   returns?: string;
-  line_range: [number, number];
 }
 
 export interface ImportInfo {
@@ -37,6 +37,5 @@ export interface ChunkMetadata {
   imports?: ImportInfo[];
   params?: string[];
   returns?: string;
-  line_range: [number, number];
   description?: string | null;
 }

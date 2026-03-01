@@ -199,7 +199,14 @@ export async function indexProject(
     }
 
     // Parse the file
-    const newChunks = await parseFile(langName, filePath, source);
+    let newChunks;
+    try {
+      newChunks = await parseFile(langName, filePath, source);
+    } catch {
+      // Skip files that fail to parse (e.g., tree-sitter WASM limits)
+      result.filesSkipped++;
+      continue;
+    }
 
     // Get existing chunk hashes to preserve unchanged metadata
     const existingHashes = getExistingChunkHashes(db, filePath);
@@ -217,9 +224,12 @@ export async function indexProject(
     });
 
     // Upsert file record
+    const dotIdx = filePath.lastIndexOf(".");
+    const extension = dotIdx !== -1 ? filePath.slice(dotIdx + 1) : null;
     upsertFile(db, {
       path: filePath,
       hash: fileHash,
+      extension,
       gitCommit: headCommit,
       lastIndexed: Date.now(),
     });

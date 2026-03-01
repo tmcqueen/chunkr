@@ -7,6 +7,7 @@ import {
   getChunksForFile,
   getChunk,
   getChunkByIndex,
+  getFiles,
   getProjectSummary,
   updateChunkMetadata,
 } from "./db.ts";
@@ -24,8 +25,9 @@ Commands:
   init [--lang <name>]  Create .chunkr.db and .chunkr.json (default: typescript)
   index [path]          Index files (full scan or incremental via git diff)
   status                Show files changed since last index
+  files [path] [--ext .ts]  List indexed files with chunk counts
   query <file>          Show all chunk metadata (YAML) for a file
-  chunk <file> <n>      Show chunk body + metadata (n = start line or chunk index)
+  chunk <file> <n>      Show chunk body (n = start line or chunk index)
   summary               Project overview: file count, languages, chunks
   describe <file> <idx> Update a chunk's description (reads from stdin)
   agent                 Output markdown guide for LLM consumption
@@ -94,6 +96,25 @@ async function main() {
       break;
     }
 
+    case "files": {
+      const db = openDb(dbPath);
+      let pathPrefix: string | undefined;
+      let ext: string | undefined;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === "--ext" && args[i + 1]) {
+          ext = args[++i];
+        } else if (!pathPrefix) {
+          pathPrefix = args[i];
+        }
+      }
+      const files = getFiles(db, { extension: ext, pathPrefix });
+      for (const f of files) {
+        console.log(`${f.path} (${f.chunkCount} chunks)`);
+      }
+      db.close();
+      break;
+    }
+
     case "query": {
       const filePath = args[1];
       if (!filePath) {
@@ -135,8 +156,6 @@ async function main() {
         console.error(`No chunk found at ${relPath}:${lineOrIndex}`);
         process.exit(1);
       }
-      console.log(`--- metadata ---`);
-      console.log(chunk.metadata);
       console.log(`--- body (lines ${chunk.startLine}-${chunk.endLine}) ---`);
       console.log(chunk.body);
       db.close();
@@ -211,17 +230,19 @@ async function main() {
 This project is indexed with chunkr. Language: **${lang}** (${extensions} files).
 
 ## Commands
+- \`chunkr files [path] [--ext .ts]\` — List indexed files with chunk counts, optionally filtered
 - \`chunkr query <file>\` — Show YAML metadata for all chunks in a file (no bodies)
-- \`chunkr chunk <file> <line>\` — Get a specific chunk's source code + metadata
+- \`chunkr chunk <file> <line>\` — Get a specific chunk's source code
 - \`chunkr summary\` — Project overview (file count, chunk count)
 - \`chunkr status\` — Files changed since last index
 - \`chunkr index\` — Re-index changed files
 
 ## Workflow
 1. Use \`chunkr summary\` to understand project scope
-2. Use \`chunkr query <file>\` to see what's in a file without reading it
-3. Use \`chunkr chunk <file> <line>\` to retrieve only the code you need
-4. After modifying files, run \`chunkr index\` to update the index
+2. Use \`chunkr files [--ext .ts]\` to discover files, filter by extension or path
+3. Use \`chunkr query <file>\` to see what's in a file without reading it
+4. Use \`chunkr chunk <file> <line>\` to retrieve only the code you need
+5. After modifying files, run \`chunkr index\` to update the index
 
 Indexed: ${summary.fileCount} files, ${summary.chunkCount} chunks.`);
       break;

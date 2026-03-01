@@ -3,39 +3,30 @@ import type { LanguageSupport } from "./registry.ts";
 import type { ChunkMetadata, ChildInfo, ImportInfo } from "../types.ts";
 
 function extractMetadata(node: any, lines: string[]): ChunkMetadata | null {
-  const startLine = node.startPosition.row + 1;
-  const endLine = node.endPosition.row + 1;
-  const lineRange: [number, number] = [startLine, endLine];
-
   switch (node.type) {
     case "class_declaration":
-      return extractTypeDecl(node, "class", lineRange);
+      return extractTypeDecl(node, "class");
     case "interface_declaration":
-      return extractTypeDecl(node, "interface", lineRange);
+      return extractTypeDecl(node, "interface");
     case "struct_declaration":
-      return extractTypeDecl(node, "struct", lineRange);
+      return extractTypeDecl(node, "struct");
     case "record_declaration":
-      return extractRecord(node, lineRange);
+      return extractRecord(node);
     case "enum_declaration":
-      return extractEnum(node, lineRange);
+      return extractEnum(node);
     case "method_declaration":
-      return extractMethod(node, lineRange);
+      return extractMethod(node);
     case "global_statement":
       return {
         name: node.text.substring(0, 40).replace(/\n/g, " "),
         type: "expression",
-        line_range: lineRange,
       };
     default:
-      return { name: node.type, type: node.type, line_range: lineRange };
+      return { name: node.type, type: node.type };
   }
 }
 
-function extractTypeDecl(
-  node: any,
-  type: string,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractTypeDecl(node: any, type: string): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
   const children: ChildInfo[] = [];
 
@@ -59,7 +50,7 @@ function extractTypeDecl(
   }
 
   const bases = node.childForFieldName("bases");
-  const meta: ChunkMetadata = { name, type, line_range: lineRange };
+  const meta: ChunkMetadata = { name, type };
   if (bases) {
     meta.returns = bases.text.replace(/^:\s*/, "");
   }
@@ -67,13 +58,10 @@ function extractTypeDecl(
   return meta;
 }
 
-function extractRecord(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractRecord(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
   const params = extractParams(node.childForFieldName("parameters"));
-  const meta: ChunkMetadata = { name, type: "record", line_range: lineRange };
+  const meta: ChunkMetadata = { name, type: "record" };
   if (params.length > 0) meta.params = params;
 
   const children: ChildInfo[] = [];
@@ -95,22 +83,16 @@ function extractRecord(
   return meta;
 }
 
-function extractEnum(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractEnum(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "enum", line_range: lineRange };
+  return { name, type: "enum" };
 }
 
-function extractMethod(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
+function extractMethod(node: any): ChunkMetadata {
   const name = node.childForFieldName("name")?.text ?? "anonymous";
   const returnType = node.childForFieldName("type")?.text;
   const params = extractParams(node.childForFieldName("parameters"));
-  const meta: ChunkMetadata = { name, type: "method", line_range: lineRange };
+  const meta: ChunkMetadata = { name, type: "method" };
   if (params.length > 0) meta.params = params;
   if (returnType) meta.returns = returnType;
   return meta;
@@ -120,11 +102,7 @@ function extractMethodChild(member: any): ChildInfo | null {
   const name = member.childForFieldName("name")?.text ?? "anonymous";
   const returnType = member.childForFieldName("type")?.text;
   const params = extractParams(member.childForFieldName("parameters"));
-  const child: ChildInfo = {
-    name,
-    type: "method",
-    line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-  };
+  const child: ChildInfo = { name, type: "method" };
   if (params.length > 0) child.params = params;
   if (returnType) child.returns = returnType;
   return child;
@@ -133,11 +111,7 @@ function extractMethodChild(member: any): ChildInfo | null {
 function extractConstructorChild(member: any): ChildInfo | null {
   const name = member.childForFieldName("name")?.text ?? "anonymous";
   const params = extractParams(member.childForFieldName("parameters"));
-  const child: ChildInfo = {
-    name,
-    type: "constructor",
-    line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-  };
+  const child: ChildInfo = { name, type: "constructor" };
   if (params.length > 0) child.params = params;
   return child;
 }
@@ -145,11 +119,7 @@ function extractConstructorChild(member: any): ChildInfo | null {
 function extractPropertyChild(member: any): ChildInfo | null {
   const name = member.childForFieldName("name")?.text ?? "anonymous";
   const propType = member.childForFieldName("type")?.text;
-  const child: ChildInfo = {
-    name,
-    type: "property",
-    line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-  };
+  const child: ChildInfo = { name, type: "property" };
   if (propType) child.returns = propType;
   return child;
 }

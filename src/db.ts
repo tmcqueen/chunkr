@@ -5,6 +5,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS files (
   path TEXT PRIMARY KEY,
   hash TEXT NOT NULL,
+  extension TEXT,
   git_commit TEXT,
   last_indexed INTEGER NOT NULL
 );
@@ -27,11 +28,20 @@ CREATE TABLE IF NOT EXISTS project (
 );
 `;
 
+function migrateExtensionColumn(db: Database): void {
+  try {
+    db.exec("ALTER TABLE files ADD COLUMN extension TEXT");
+  } catch {
+    // Column already exists
+  }
+}
+
 export function initDb(dbPath: string): Database {
   const db = new Database(dbPath, { create: true });
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  migrateExtensionColumn(db);
   return db;
 }
 
@@ -39,23 +49,56 @@ export function openDb(dbPath: string): Database {
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  migrateExtensionColumn(db);
   return db;
 }
 
 export function getFile(db: Database, path: string): FileRecord | null {
-  return db
-    .query<{ path: string; hash: string; git_commit: string | null; last_indexed: number }, [string]>(
-      "SELECT path, hash, git_commit, last_indexed FROM files WHERE path = ?"
+  const row = db
+    .query<{ path: string; hash: string; extension: string | null; git_commit: string | null; last_indexed: number }, [string]>(
+      "SELECT path, hash, extension, git_commit, last_indexed FROM files WHERE path = ?"
     )
-    .get(path) as FileRecord | null;
+    .get(path);
+  if (!row) return null;
+  return { path: row.path, hash: row.hash, extension: row.extension, gitCommit: row.git_commit, lastIndexed: row.last_indexed };
+}
+
+export function getFiles(
+  db: Database,
+  opts?: { extension?: string; pathPrefix?: string }
+): { path: string; chunkCount: number }[] {
+  let sql = `SELECT f.path, COUNT(c.id) as chunk_count
+    FROM files f LEFT JOIN chunks c ON c.file_path = f.path`;
+  const conditions: string[] = [];
+  const params: string[] = [];
+
+  if (opts?.extension) {
+    const ext = opts.extension.startsWith(".") ? opts.extension.slice(1) : opts.extension;
+    conditions.push("f.extension = ?");
+    params.push(ext);
+  }
+  if (opts?.pathPrefix) {
+    conditions.push("f.path LIKE ?");
+    params.push(opts.pathPrefix + "%");
+  }
+
+  if (conditions.length > 0) {
+    sql += " WHERE " + conditions.join(" AND ");
+  }
+  sql += " GROUP BY f.path ORDER BY f.path";
+
+  return db
+    .query<{ path: string; chunk_count: number }, string[]>(sql)
+    .all(...params)
+    .map((r) => ({ path: r.path, chunkCount: r.chunk_count }));
 }
 
 export function upsertFile(db: Database, record: FileRecord): void {
   db.run(
-    `INSERT INTO files (path, hash, git_commit, last_indexed)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, git_commit=excluded.git_commit, last_indexed=excluded.last_indexed`,
-    [record.path, record.hash, record.gitCommit, record.lastIndexed]
+    `INSERT INTO files (path, hash, extension, git_commit, last_indexed)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(path) DO UPDATE SET hash=excluded.hash, extension=excluded.extension, git_commit=excluded.git_commit, last_indexed=excluded.last_indexed`,
+    [record.path, record.hash, record.extension, record.gitCommit, record.lastIndexed]
   );
 }
 
