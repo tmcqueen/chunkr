@@ -1,27 +1,24 @@
-import type { ChunkMetadata, ChunkRecord, ChildInfo, ImportInfo } from "./types.ts";
+import type { ChunkRecord, ImportInfo } from "./types.ts";
+import type { LanguageSupport } from "./languages/registry.ts";
+import { getLanguageSupport } from "./languages/registry.ts";
 import { toYaml } from "./yaml.ts";
 import { resolve } from "path";
 
-// Lazy-initialized parser and languages
+// Side-effect imports to register languages
+import "./languages/typescript.ts";
+import "./languages/csharp.ts";
+
+// Lazy-initialized parser
 let ParserClass: any;
 let initPromise: Promise<void> | null = null;
-const languages: Map<string, any> = new Map();
+const grammars: Map<string, any> = new Map();
 
-// Find node_modules relative to this file
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const WASM_DIR = resolve(PROJECT_ROOT, "node_modules/tree-sitter-wasms/out");
-
-const EXT_TO_LANG: Record<string, string> = {
-  ".ts": "typescript",
-  ".tsx": "tsx",
-  ".js": "javascript",
-  ".jsx": "javascript",
-};
 
 async function ensureInit(): Promise<void> {
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    // web-tree-sitter is CJS-only, use require
     const WTS = require("web-tree-sitter");
     await WTS.init();
     ParserClass = WTS;
@@ -29,37 +26,45 @@ async function ensureInit(): Promise<void> {
   return initPromise;
 }
 
-async function getLanguage(langName: string): Promise<any> {
-  if (languages.has(langName)) return languages.get(langName)!;
+async function getGrammar(grammarName: string): Promise<any> {
+  if (grammars.has(grammarName)) return grammars.get(grammarName)!;
   await ensureInit();
-  const wasmPath = resolve(WASM_DIR, `tree-sitter-${langName}.wasm`);
+  const wasmPath = resolve(WASM_DIR, `tree-sitter-${grammarName}.wasm`);
   const lang = await ParserClass.Language.load(wasmPath);
-  languages.set(langName, lang);
+  grammars.set(grammarName, lang);
   return lang;
 }
 
-export function getSupportedExtensions(): string[] {
-  return Object.keys(EXT_TO_LANG);
-}
-
-export function isSupported(filePath: string): boolean {
+function getGrammarForFile(langSupport: LanguageSupport, filePath: string): string {
   const ext = "." + filePath.split(".").pop();
-  return ext in EXT_TO_LANG;
+  if (langSupport.grammarForExtension?.[ext]) {
+    return langSupport.grammarForExtension[ext];
+  }
+  return langSupport.grammarName;
 }
 
-/** Parse a source file into chunks, one per top-level declaration. */
+export function getSupportedExtensions(langName: string): string[] {
+  return getLanguageSupport(langName).extensions;
+}
+
+export function isSupported(langName: string, filePath: string): boolean {
+  const ext = "." + filePath.split(".").pop();
+  return getLanguageSupport(langName).extensions.includes(ext);
+}
+
+/** Parse a source file into chunks using the specified language. */
 export async function parseFile(
+  langName: string,
   filePath: string,
   source: string
 ): Promise<ChunkRecord[]> {
-  const ext = "." + filePath.split(".").pop();
-  const langName = EXT_TO_LANG[ext];
-  if (!langName) return [];
+  const langSupport = getLanguageSupport(langName);
+  const grammarName = getGrammarForFile(langSupport, filePath);
 
   await ensureInit();
-  const lang = await getLanguage(langName);
+  const grammar = await getGrammar(grammarName);
   const parser = new ParserClass();
-  parser.setLanguage(lang);
+  parser.setLanguage(grammar);
 
   const tree = parser.parse(source);
   const root = tree.rootNode;
@@ -69,26 +74,45 @@ export async function parseFile(
   const fileImports: ImportInfo[] = [];
   let chunkIndex = 0;
 
-  for (let i = 0; i < root.namedChildCount; i++) {
-    const node = root.namedChild(i);
-    if (!node) continue;
-
-    // Collect imports but don't create chunks for them
-    if (node.type === "import_statement") {
-      const imp = extractImport(node);
+  function processNode(node: any): void {
+    // Collect imports
+    if (langSupport.importNodeTypes.includes(node.type)) {
+      const imp = langSupport.extractImport(node);
       if (imp) fileImports.push(imp);
-      continue;
+      return;
     }
 
-    const meta = extractMetadata(node, lines);
-    if (!meta) continue;
+    // Unwrap namespace-like nodes
+    if (langSupport.unwrapNodeTypes.includes(node.type)) {
+      if (node.type === "namespace_declaration") {
+        const body = node.childForFieldName("body");
+        if (body) {
+          for (let i = 0; i < body.namedChildCount; i++) {
+            const child = body.namedChild(i);
+            if (child) processNode(child);
+          }
+        }
+      } else {
+        // file_scoped_namespace_declaration — skip qualified_name
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child && child.type !== "qualified_name") {
+            processNode(child);
+          }
+        }
+      }
+      return;
+    }
+
+    const meta = langSupport.extractMetadata(node, lines);
+    if (!meta) return;
 
     // Attach file imports to the first chunk
     if (chunkIndex === 0 && fileImports.length > 0) {
       meta.imports = fileImports;
     }
 
-    const startLine = node.startPosition.row + 1; // 1-indexed
+    const startLine = node.startPosition.row + 1;
     const endLine = node.endPosition.row + 1;
     const body = lines.slice(node.startPosition.row, node.endPosition.row + 1).join("\n");
     const hash = new Bun.CryptoHasher("md5").update(body).digest("hex");
@@ -105,205 +129,10 @@ export async function parseFile(
     chunkIndex++;
   }
 
+  for (let i = 0; i < root.namedChildCount; i++) {
+    const node = root.namedChild(i);
+    if (node) processNode(node);
+  }
+
   return chunks;
-}
-
-function extractMetadata(
-  node: any,
-  lines: string[]
-): ChunkMetadata | null {
-  const startLine = node.startPosition.row + 1;
-  const endLine = node.endPosition.row + 1;
-  const lineRange: [number, number] = [startLine, endLine];
-
-  // Unwrap export_statement
-  if (node.type === "export_statement") {
-    // Find the inner declaration
-    let inner: any = null;
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (child.type !== "decorator") {
-        inner = child;
-        break;
-      }
-    }
-    if (!inner) {
-      return {
-        name: "export",
-        type: "export",
-        line_range: lineRange,
-      };
-    }
-    const meta = extractMetadata(inner, lines);
-    if (meta) {
-      meta.exports = true;
-      meta.line_range = lineRange; // Use the export statement's range
-    }
-    return meta;
-  }
-
-  switch (node.type) {
-    case "class_declaration":
-      return extractClass(node, lineRange);
-    case "abstract_class_declaration":
-      return extractClass(node, lineRange);
-    case "function_declaration":
-      return extractFunction(node, lineRange);
-    case "lexical_declaration":
-      return extractLexical(node, lineRange);
-    case "enum_declaration":
-      return extractEnum(node, lineRange);
-    case "interface_declaration":
-      return extractInterface(node, lineRange);
-    case "type_alias_declaration":
-      return extractTypeAlias(node, lineRange);
-    case "expression_statement":
-      return {
-        name: node.text.substring(0, 40).replace(/\n/g, " "),
-        type: "expression",
-        line_range: lineRange,
-      };
-    default:
-      return {
-        name: node.type,
-        type: node.type,
-        line_range: lineRange,
-      };
-  }
-}
-
-function extractClass(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
-  const name = node.childForFieldName("name")?.text ?? "anonymous";
-  const children: ChildInfo[] = [];
-
-  const body = node.childForFieldName("body");
-  if (body) {
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const member = body.namedChild(i);
-      if (!member) continue;
-
-      if (member.type === "method_definition") {
-        const methodName = member.childForFieldName("name")?.text ?? "anonymous";
-        const params = extractParams(member.childForFieldName("parameters"));
-        const ret = member.childForFieldName("return_type")?.text?.replace(/^:\s*/, "");
-        const child: ChildInfo = {
-          name: methodName,
-          type: "method",
-          line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-        };
-        if (params.length > 0) child.params = params;
-        if (ret) child.returns = ret;
-        children.push(child);
-      } else if (member.type === "public_field_definition") {
-        const fieldName = member.childForFieldName("name")?.text ?? "anonymous";
-        children.push({
-          name: fieldName,
-          type: "property",
-          line_range: [member.startPosition.row + 1, member.endPosition.row + 1],
-        });
-      }
-    }
-  }
-
-  const meta: ChunkMetadata = { name, type: "class", line_range: lineRange };
-  if (children.length > 0) meta.children = children;
-  return meta;
-}
-
-function extractFunction(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
-  const name = node.childForFieldName("name")?.text ?? "anonymous";
-  const params = extractParams(node.childForFieldName("parameters"));
-  const ret = node.childForFieldName("return_type")?.text?.replace(/^:\s*/, "");
-
-  const meta: ChunkMetadata = { name, type: "function", line_range: lineRange };
-  if (params.length > 0) meta.params = params;
-  if (ret) meta.returns = ret;
-  return meta;
-}
-
-function extractLexical(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
-  // Get const/let keyword
-  let kind = "const";
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
-    if (child.type === "const" || child.text === "const") kind = "const";
-    else if (child.type === "let" || child.text === "let") kind = "let";
-  }
-
-  const declarator = node.namedChild(0);
-  const name = declarator?.childForFieldName("name")?.text ?? "anonymous";
-
-  // Check if it's an arrow function
-  const value = declarator?.childForFieldName("value");
-  if (value?.type === "arrow_function") {
-    const params = extractParams(value.childForFieldName("parameters"));
-    const ret = value.childForFieldName("return_type")?.text?.replace(/^:\s*/, "");
-    const meta: ChunkMetadata = { name, type: kind, line_range: lineRange };
-    if (params.length > 0) meta.params = params;
-    if (ret) meta.returns = ret;
-    return meta;
-  }
-
-  return { name, type: kind, line_range: lineRange };
-}
-
-function extractEnum(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
-  const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "enum", line_range: lineRange };
-}
-
-function extractInterface(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
-  const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "interface", line_range: lineRange };
-}
-
-function extractTypeAlias(
-  node: any,
-  lineRange: [number, number]
-): ChunkMetadata {
-  const name = node.childForFieldName("name")?.text ?? "anonymous";
-  return { name, type: "type", line_range: lineRange };
-}
-
-function extractParams(paramsNode: any): string[] {
-  if (!paramsNode) return [];
-  const params: string[] = [];
-  for (let i = 0; i < paramsNode.namedChildCount; i++) {
-    params.push(paramsNode.namedChild(i).text);
-  }
-  return params;
-}
-
-function extractImport(node: any): ImportInfo | null {
-  // import { Foo } from './foo'
-  // import Foo from './foo'
-  let name = "";
-  let from = "";
-
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
-    if (child.type === "import_clause") {
-      name = child.text;
-    } else if (child.type === "string") {
-      from = child.text.replace(/['"]/g, "");
-    }
-  }
-
-  if (name && from) return { name, from };
-  return null;
 }
