@@ -166,6 +166,119 @@ function isTestPath(path: string): boolean {
 }
 
 /**
+ * Rank a chunk for selection priority.
+ * Lower number = higher priority.
+ *   0: classes, interfaces, structs (architectural understanding)
+ *   1: functions/methods with children (complex implementations)
+ *   2: everything else
+ */
+function chunkPriority(metadata: string): number {
+  if (/type:\s*(class|interface|struct|enum|record)/m.test(metadata)) return 0;
+  if (/type:\s*(function|method)/m.test(metadata) && /children:/m.test(metadata))
+    return 1;
+  return 2;
+}
+
+/**
+ * Select up to `budget` chunks from per-file buckets using round-robin.
+ * Within each file, chunks are sorted by priority (classes first, then
+ * complex functions, then the rest). Round-robin ensures breadth across
+ * files rather than exhausting one file before moving to the next.
+ */
+function selectChunksByBudget(
+  perFileBuckets: Map<string, ChunkRow[]>,
+  budget: number
+): Set<ChunkRow> {
+  const selected = new Set<ChunkRow>();
+
+  // Sort each bucket by priority
+  for (const [, chunks] of perFileBuckets) {
+    chunks.sort((a, b) => chunkPriority(a.metadata) - chunkPriority(b.metadata));
+  }
+
+  // Round-robin across files
+  const fileKeys = [...perFileBuckets.keys()];
+  const cursors = new Map<string, number>(fileKeys.map((k) => [k, 0]));
+  let remaining = budget;
+
+  while (remaining > 0) {
+    let anyPicked = false;
+    for (const key of fileKeys) {
+      if (remaining <= 0) break;
+      const bucket = perFileBuckets.get(key)!;
+      const cursor = cursors.get(key)!;
+      if (cursor < bucket.length) {
+        selected.add(bucket[cursor]);
+        cursors.set(key, cursor + 1);
+        remaining--;
+        anyPicked = true;
+      }
+    }
+    if (!anyPicked) break;
+  }
+
+  return selected;
+}
+
+const ARCHITECTURAL_STEMS = new Set([
+  "index", "types", "main", "mod", "lib", "config", "app", "schema", "core", "base", "utils",
+]);
+
+/**
+ * Select up to `fileBudget` files from the filtered list using round-robin
+ * across parent directories. Files with architectural stem names (index,
+ * types, main, etc.) are prioritized within each directory bucket.
+ */
+function selectFilesByBudget(files: string[], fileBudget: number): string[] {
+  // Group by parent directory
+  const byDir = new Map<string, string[]>();
+  for (const f of files) {
+    const lastSlash = f.lastIndexOf("/");
+    const dir = lastSlash >= 0 ? f.substring(0, lastSlash) : ".";
+    let arr = byDir.get(dir);
+    if (!arr) {
+      arr = [];
+      byDir.set(dir, arr);
+    }
+    arr.push(f);
+  }
+
+  // Sort each bucket: architectural stems first (priority 0), then alphabetically
+  for (const [, bucket] of byDir) {
+    bucket.sort((a, b) => {
+      const stemA = a.split("/").pop()?.split(".")[0] ?? "";
+      const stemB = b.split("/").pop()?.split(".")[0] ?? "";
+      const prioA = ARCHITECTURAL_STEMS.has(stemA) ? 0 : 1;
+      const prioB = ARCHITECTURAL_STEMS.has(stemB) ? 0 : 1;
+      if (prioA !== prioB) return prioA - prioB;
+      return a.localeCompare(b);
+    });
+  }
+
+  // Round-robin across directories
+  const dirKeys = [...byDir.keys()].sort();
+  const cursors = new Map<string, number>(dirKeys.map((k) => [k, 0]));
+  const selected: string[] = [];
+
+  while (selected.length < fileBudget) {
+    let anyPicked = false;
+    for (const dir of dirKeys) {
+      if (selected.length >= fileBudget) break;
+      const bucket = byDir.get(dir)!;
+      const cursor = cursors.get(dir)!;
+      if (cursor < bucket.length) {
+        selected.push(bucket[cursor]);
+        cursors.set(dir, cursor + 1);
+        anyPicked = true;
+      }
+    }
+    if (!anyPicked) break;
+  }
+
+  return selected;
+}
+
+/**
  * Simulate the chunkr exploration workflow by reading directly from the DB.
  * This produces the same data as running CLI commands, but is orders of
  * magnitude faster for large repos.
@@ -175,8 +288,17 @@ function isTestPath(path: string): boolean {
  *   2. files — list files with chunk counts, filter out test paths
  *   3. query filtered files — metadata only, no bodies
  *   4. chunk exported/public declarations — body only (no metadata)
+ *
+ * When `chunkBudget` is set, only that many exported chunk bodies are read,
+ * selected via round-robin across files (prioritizing classes/interfaces,
+ * then complex functions). This simulates an agent that reads metadata for
+ * everything but only fetches bodies for a targeted subset.
  */
-function simulateExploration(dbPath: string): {
+function simulateExploration(
+  dbPath: string,
+  chunkBudget?: number,
+  fileBudget?: number
+): {
   totalBytes: number;
   filesQueried: number;
   totalFiles: number;
@@ -244,8 +366,14 @@ function simulateExploration(dbPath: string): {
     arr.push(c);
   }
 
-  const filteredSet = new Set(filteredFiles);
-  let chunksRead = 0;
+  // When fileBudget is set, only query metadata for a subset of files
+  const queriedFiles = fileBudget != null
+    ? selectFilesByBudget(filteredFiles, fileBudget)
+    : filteredFiles;
+  const filteredSet = new Set(queriedFiles);
+
+  // Collect all exported chunks across queried files (for budget selection)
+  const exportedByFile = new Map<string, ChunkRow[]>();
 
   for (const [filePath, chunks] of chunksByFile) {
     if (!filteredSet.has(filePath)) continue;
@@ -256,22 +384,38 @@ function simulateExploration(dbPath: string): {
       totalBytes += Buffer.byteLength(queryLine, "utf-8");
     }
 
-    // 4. Selectively read exported/public chunks (body only, no metadata)
-    for (const c of chunks) {
-      if (isExportedOrPublic(c.metadata)) {
-        const chunkOutput =
-          `--- body (lines ${c.start_line}-${c.end_line}) ---\n${c.body}\n`;
-        totalBytes += Buffer.byteLength(chunkOutput, "utf-8");
-        chunksRead++;
-      }
+    // Collect exported chunks for this file
+    const exported = chunks.filter((c) => isExportedOrPublic(c.metadata));
+    if (exported.length > 0) {
+      exportedByFile.set(filePath, exported);
     }
+  }
+
+  // 4. Read chunk bodies — either all exports or a budgeted subset
+  let selectedChunks: Set<ChunkRow>;
+  if (chunkBudget != null) {
+    selectedChunks = selectChunksByBudget(exportedByFile, chunkBudget);
+  } else {
+    // No budget — read all exported chunks
+    selectedChunks = new Set<ChunkRow>();
+    for (const chunks of exportedByFile.values()) {
+      for (const c of chunks) selectedChunks.add(c);
+    }
+  }
+
+  let chunksRead = 0;
+  for (const c of selectedChunks) {
+    const chunkOutput =
+      `--- body (lines ${c.start_line}-${c.end_line}) ---\n${c.body}\n`;
+    totalBytes += Buffer.byteLength(chunkOutput, "utf-8");
+    chunksRead++;
   }
 
   db.close();
 
   return {
     totalBytes,
-    filesQueried: filteredFiles.length,
+    filesQueried: queriedFiles.length,
     totalFiles: filePaths.length,
     chunksRead,
   };
@@ -294,14 +438,19 @@ function isExportedOrPublic(metadata: string): boolean {
 // Main benchmark
 // ---------------------------------------------------------------------------
 
-async function benchmarkRepo(repo: RepoConfig): Promise<{
+interface BenchmarkResult {
   language: string;
   url: string;
   commit: string;
   loc: number;
-  estimatedTokens: number;
-  tokensUsed: number;
-}> {
+  naiveTokens: number;
+  fullTokens: number;
+  budget50Tokens: number;
+  budget10Tokens: number;
+  targetedTokens: number;
+}
+
+async function benchmarkRepo(repo: RepoConfig): Promise<BenchmarkResult> {
   const repoName = repo.url.split("/").pop()?.replace(".git", "") ?? "unknown";
   const tmpDir = await mkdtemp(join(tmpdir(), `chunkr-bench-${repoName}-`));
 
@@ -321,9 +470,9 @@ async function benchmarkRepo(repo: RepoConfig): Promise<{
     // 4. Count LOC + estimate tokens
     console.log(`  Measuring source files ...`);
     const { loc, bytes } = await measureSource(sourceDir, repo.extensions);
-    const estimatedTokens = Math.round(bytes / 4);
+    const naiveTokens = Math.round(bytes / 4);
     console.log(
-      `  LOC: ${loc.toLocaleString()}, Estimated tokens: ${estimatedTokens.toLocaleString()}`
+      `  LOC: ${loc.toLocaleString()}, Naive tokens: ${naiveTokens.toLocaleString()}`
     );
 
     // 5. Init chunkr
@@ -335,19 +484,40 @@ async function benchmarkRepo(repo: RepoConfig): Promise<{
     const indexOutput = await chunkr(indexArgs, tmpDir);
     console.log(`  ${indexOutput.trim()}`);
 
-    // 7. Simulate exploration via direct DB access
+    // 7. Simulate exploration at multiple budget levels
     const dbPath = join(tmpDir, ".chunkr.db");
     console.log(`  Simulating chunkr exploration ...`);
-    const { totalBytes, filesQueried, totalFiles, chunksRead } =
-      simulateExploration(dbPath);
 
-    const tokensUsed = Math.round(totalBytes / 4);
-    const ratio = ((tokensUsed / estimatedTokens) * 100).toFixed(1);
+    const full = simulateExploration(dbPath);
+    const b50 = simulateExploration(dbPath, 50);
+    const b10 = simulateExploration(dbPath, 10);
+    const targeted = simulateExploration(dbPath, 10, 10);
+
+    const fullTokens = Math.round(full.totalBytes / 4);
+    const budget50Tokens = Math.round(b50.totalBytes / 4);
+    const budget10Tokens = Math.round(b10.totalBytes / 4);
+    const targetedTokens = Math.round(targeted.totalBytes / 4);
+
+    const pct = (n: number) => ((n / naiveTokens) * 100).toFixed(1);
+
     console.log(
-      `  Files queried: ${filesQueried}/${totalFiles}, Exported chunks read: ${chunksRead}`
+      `  Files queried: ${full.filesQueried}/${full.totalFiles}, Exported chunks: ${full.chunksRead}`
+    );
+    console.log(`  Tokens:`);
+    console.log(
+      `    Naive:      ${naiveTokens.toLocaleString().padStart(10)}`
     );
     console.log(
-      `  Tokens used: ${tokensUsed.toLocaleString()} (${ratio}% of naive)`
+      `    Full:       ${fullTokens.toLocaleString().padStart(10)} (${pct(fullTokens)}%)`
+    );
+    console.log(
+      `    Budget 50:  ${budget50Tokens.toLocaleString().padStart(10)} (${pct(budget50Tokens)}%)`
+    );
+    console.log(
+      `    Budget 10:  ${budget10Tokens.toLocaleString().padStart(10)} (${pct(budget10Tokens)}%)`
+    );
+    console.log(
+      `    Targeted:   ${targetedTokens.toLocaleString().padStart(10)} (${pct(targetedTokens)}%)`
     );
 
     return {
@@ -355,8 +525,11 @@ async function benchmarkRepo(repo: RepoConfig): Promise<{
       url: repo.url,
       commit,
       loc,
-      estimatedTokens,
-      tokensUsed,
+      naiveTokens,
+      fullTokens,
+      budget50Tokens,
+      budget10Tokens,
+      targetedTokens,
     };
   } finally {
     console.log(`  Cleaning up ${tmpDir} ...`);
@@ -369,7 +542,7 @@ async function main() {
 
   const csvPath = resolve(import.meta.dir, "token-scaling.csv");
   const header =
-    "Language,Repo URL,Commit Short Hash,LOC,Estimated Tokens,Tokens Used";
+    "Language,Repo URL,Commit,LOC,Naive Tokens,Full Tokens,Budget50 Tokens,Budget10 Tokens,Targeted Tokens";
   await Bun.write(csvPath, header + "\n");
 
   for (let i = 0; i < REPOS.length; i++) {
@@ -385,8 +558,11 @@ async function main() {
         result.url,
         result.commit,
         result.loc,
-        result.estimatedTokens,
-        result.tokensUsed,
+        result.naiveTokens,
+        result.fullTokens,
+        result.budget50Tokens,
+        result.budget10Tokens,
+        result.targetedTokens,
       ].join(",");
 
       const existing = await Bun.file(csvPath).text();

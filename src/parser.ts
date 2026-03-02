@@ -73,6 +73,7 @@ export async function parseFile(
   const chunks: ChunkRecord[] = [];
   const fileImports: ImportInfo[] = [];
   let chunkIndex = 0;
+  let importsAttached = false;
 
   function processNode(node: any): void {
     // Collect imports
@@ -107,9 +108,10 @@ export async function parseFile(
     const meta = langSupport.extractMetadata(node, lines);
     if (!meta) return;
 
-    // Attach file imports to the first chunk
-    if (chunkIndex === 0 && fileImports.length > 0) {
+    // Attach file imports to the first chunk after imports are collected
+    if (!importsAttached && fileImports.length > 0) {
       meta.imports = fileImports;
+      importsAttached = true;
     }
 
     const startLine = node.startPosition.row + 1;

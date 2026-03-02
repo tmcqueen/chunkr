@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "tree-sitter-example",
+      "name": "chunkr",
       "dependencies": {
         "tree-sitter-wasms": "^0.1.13",
         "web-tree-sitter": "0.24.7",
